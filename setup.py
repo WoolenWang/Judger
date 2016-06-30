@@ -3,10 +3,9 @@ import platform
 from distutils.core import setup, Extension
 
 
+libraries = ['pthread']
 if platform.system() != 'Darwin':
-    libraries = ['seccomp']
-else:
-    libraries = []
+    libraries.append('seccomp')
     
 setup(name='judger', 
       version='1.0', 

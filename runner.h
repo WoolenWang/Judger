@@ -59,9 +59,15 @@ struct config {
 void run(struct config *, struct result *);
 
 
-struct clone_args {
+struct child_process_args {
     struct config *config;
     FILE *log_fp;
 };
 
+
+struct timeout_killer_args {
+    pid_t pid;
+    int timeout;
+    FILE *log_fp;
+};
 #endif

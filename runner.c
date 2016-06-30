@@ -8,6 +8,7 @@
 #else
 #warning "###### This judger can not work under OSX, installation is only for dev dependencies! #####"
 #endif
+#include <pthread.h>
 #include <signal.h>
 #include <errno.h>
 #include <pwd.h>
@@ -23,32 +24,20 @@
 #define STACK_SIZE (2 * 1024 * 1024)
 
 
-int set_timer(int sec, int ms, int is_cpu_time) {
-    struct itimerval time_val;
-    time_val.it_interval.tv_sec = time_val.it_interval.tv_usec = 0;
-    time_val.it_value.tv_sec = sec;
-    time_val.it_value.tv_usec = ms * 1000;
-    if (setitimer(is_cpu_time ? ITIMER_VIRTUAL : ITIMER_REAL, &time_val, NULL)) {
-        return SETITIMER_FAILED;
-    }
-    return SUCCESS;
-}
-
-
-int child_process(void *clone_args){
-    FILE *log_fp = ((struct clone_args *)clone_args)->log_fp;
-    struct config *config = ((struct clone_args *)clone_args)->config;
+int child_process(void *child_process_args){
+    FILE *log_fp = ((struct child_process_args *)child_process_args)->log_fp;
+    struct config *config = ((struct child_process_args *)child_process_args)->config;
     FILE *in_file = NULL, *out_file = NULL, *err_file = NULL;
     struct rlimit memory_limit, cpu_time_rlimit;
 #ifndef __APPLE__
     int i;
-    int syscalls_whitelist[] = {SCMP_SYS(read), SCMP_SYS(fstat),
+    int syscall_whitelist[] = {SCMP_SYS(read), SCMP_SYS(fstat),
                                 SCMP_SYS(mmap), SCMP_SYS(mprotect), 
                                 SCMP_SYS(munmap), SCMP_SYS(open), 
                                 SCMP_SYS(arch_prctl), SCMP_SYS(brk), 
                                 SCMP_SYS(access), SCMP_SYS(exit_group), 
                                 SCMP_SYS(close)};
-    int syscalls_whitelist_length = sizeof(syscalls_whitelist) / sizeof(int);
+    int syscall_whitelist_length = sizeof(syscall_whitelist) / sizeof(int);
     scmp_filter_ctx ctx = NULL;
 #endif
     // child process
@@ -62,19 +51,12 @@ int child_process(void *clone_args){
         }
     }
     if (config->max_cpu_time != CPU_TIME_UNLIMITED) {
-        // cpu time
-        if (set_timer(config->max_cpu_time / 1000, config->max_cpu_time % 1000, 1) != SUCCESS) {
-            LOG_FATAL(log_fp, "set cpu time timer failed");
-            ERROR(log_fp, SETITIMER_FAILED);
-        }
-        // real time
-        if (set_timer(config->max_real_time / 1000, config->max_real_time % 1000, 0) != SUCCESS) {
-            LOG_FATAL(log_fp, "set real time timer failed");
-            ERROR(log_fp, SETITIMER_FAILED);
-        }
-
-        // child process can not inherit timeout rules from parent process defined by setitimer, so we use setrlimit to
-        // control child process max running time
+        // we do not use setitimer to limit cpu/real time anymore
+        // because timer signal can be caught by process and 
+        // timer can be cancelled/changed if there is no syscall filter
+        // none root can not change setrlimit hard limit
+        // another reason is child process can not inherit timeout rules from parent process defined by setitimer,
+        // but setrlimit rule can be inherited
         cpu_time_rlimit.rlim_cur = cpu_time_rlimit.rlim_max = (config->max_cpu_time + 1000) / 1000;
         if (setrlimit(RLIMIT_CPU, &cpu_time_rlimit) == -1) {
             LOG_FATAL(log_fp, "setrlimit cpu time failed, errno: %d", errno);
@@ -139,8 +121,8 @@ int child_process(void *clone_args){
             LOG_FATAL(log_fp, "init seccomp failed");
             ERROR(log_fp, LOAD_SECCOMP_FAILED);
         }
-        for (i = 0; i < syscalls_whitelist_length; i++) {
-            if (seccomp_rule_add(ctx, SCMP_ACT_ALLOW, syscalls_whitelist[i], 0) != 0) {
+        for (i = 0; i < syscall_whitelist_length; i++) {
+            if (seccomp_rule_add(ctx, SCMP_ACT_ALLOW, syscall_whitelist[i], 0) != 0) {
                 LOG_FATAL(log_fp, "load syscall white list failed");
                 ERROR(log_fp, LOAD_SECCOMP_FAILED);
             }
@@ -169,15 +151,50 @@ int child_process(void *clone_args){
 }
 
 
+int kill_pid(pid_t pid) {
+    return kill(pid, SIGKILL);
+}
+
+
+void *timeout_killer(void *timeout_killer_args) {
+    // this is a new thread, kill the process if timeout
+    FILE *log_fp = ((struct timeout_killer_args *)timeout_killer_args)->log_fp;
+    pid_t pid = ((struct timeout_killer_args *)timeout_killer_args)->pid;
+    int timeout = ((struct timeout_killer_args *)timeout_killer_args)->timeout;
+    // On success, pthread_detach() returns 0; on error, it returns an error number.
+    if (pthread_detach(pthread_self()) != 0) {
+        LOG_FATAL(log_fp, "pthread_detach failed");
+        kill_pid(pid);
+        return NULL;
+    }
+    // usleep can't be used, time args must < 1000ms
+    // this may sleep longer that expected, but we will have a check at the end
+    if (sleep((timeout + 1000) / 1000) != 0) {
+        LOG_FATAL(log_fp, "sleep failed");
+        kill_pid(pid);
+        return NULL;
+    }
+    if (kill(pid, SIGKILL) != 0) {
+        LOG_WARNING(log_fp, "kill failed, pid: %d", pid);
+        return NULL;
+    }
+    LOG_DEBUG(log_fp, "pid %d is killed", pid);
+    return NULL;
+}
+    
+
 void run(struct config *config, struct result *result) {
     int status;
     struct rusage resource_usage;
     struct timeval start, end;
     
-    int signal, pid;
+    int signal;
+    pid_t pid;
+    pthread_t tid;
     FILE *log_fp = NULL;
     char *stack = NULL;
-    struct clone_args clone_args;
+    struct child_process_args child_process_args;
+    struct timeout_killer_args timeout_killer_args;
     
     log_fp = log_open(config->log_path);
     if(log_fp == NULL){
@@ -199,6 +216,12 @@ void run(struct config *config, struct result *result) {
         log_close(log_fp);
         return;
     }
+    else if (config->max_cpu_time != CPU_TIME_UNLIMITED && config->max_real_time < 1) {
+            LOG_FATAL(log_fp, "max_real_time must be set when max_cpu_time is set");
+            result->flag = SYSTEM_ERROR;
+            log_close(log_fp);
+            return;
+    }
     if((stack = malloc(STACK_SIZE)) == NULL) {
         LOG_FATAL(log_fp, "malloc stack failed");
         result->flag = SYSTEM_ERROR;
@@ -206,18 +229,30 @@ void run(struct config *config, struct result *result) {
         return; 
     }
 
-    clone_args.config = config;
-    clone_args.log_fp = log_fp;
-    pid = clone(child_process, stack + STACK_SIZE, SIGCHLD, (void *)(&clone_args));
+    child_process_args.config = config;
+    child_process_args.log_fp = log_fp;
+    pid = clone(child_process, stack + STACK_SIZE, SIGCHLD, (void *)(&child_process_args));
 
     if (pid < 0) {
-        LOG_FATAL(log_fp, "fork failed");
+        LOG_FATAL(log_fp, "clone failed");
         result->flag = SYSTEM_ERROR;
         log_close(log_fp);
         return;
     }
     else {
         // parent process
+        if (config->max_cpu_time != CPU_TIME_UNLIMITED) {
+            // start a new thread to watch real time
+            timeout_killer_args.pid = pid;
+            timeout_killer_args.timeout = config->max_real_time;
+            timeout_killer_args.log_fp = log_fp;
+            if (pthread_create(&tid, NULL, timeout_killer, (void *) (&timeout_killer_args)) != 0) {
+                LOG_FATAL(log_fp, "pthread_create failed");
+                result->flag = SYSTEM_ERROR;
+                log_close(log_fp);
+                return;
+            }
+        }
 
         // on success, returns the process ID of the child whose state has changed;
         // On error, -1 is returned.
@@ -226,6 +261,12 @@ void run(struct config *config, struct result *result) {
             result->flag = SYSTEM_ERROR;
             log_close(log_fp);
             return;
+        }
+        // process exited, we may need to cancel timeout killer thread
+        if (config->max_cpu_time != CPU_TIME_UNLIMITED) {
+            if (pthread_cancel(tid) != 0) {
+                LOG_WARNING(log_fp, "pthread_cancel failed");
+            };
         }
         LOG_DEBUG(log_fp, "exit status: %d", WEXITSTATUS(status));
         result->exit_status = WEXITSTATUS(status);
@@ -247,6 +288,10 @@ void run(struct config *config, struct result *result) {
         result->signal = 0;
         result->flag = SUCCESS;
 
+        if (WEXITSTATUS(status) != 0) {
+            result->flag = RUNTIME_ERROR;
+        }
+        // if signaled
         if (WIFSIGNALED(status) != 0) {
             signal = WTERMSIG(status);
             LOG_DEBUG(log_fp, "signal: %d", signal);
@@ -257,14 +302,6 @@ void run(struct config *config, struct result *result) {
             else if (signal == SIGVTALRM) {
                 result->flag = CPU_TIME_LIMIT_EXCEEDED;
             }
-            else if (signal == SIGSEGV) {
-                if (config->max_memory != MEMORY_UNLIMITED && result->memory > config->max_memory) {
-                    result->flag = MEMORY_LIMIT_EXCEEDED;
-                }
-                else {
-                    result->flag = RUNTIME_ERROR;
-                }
-            }
             // Child process error
             else if (signal == SIGUSR1){
                 result->flag = SYSTEM_ERROR;
@@ -273,16 +310,19 @@ void run(struct config *config, struct result *result) {
                 result->flag = RUNTIME_ERROR;
             }
         }
-        else {
-            if (config->max_memory != MEMORY_UNLIMITED && result->memory > config->max_memory) {
-                result->flag = MEMORY_LIMIT_EXCEEDED;
-            }
-            if (WEXITSTATUS(status) != 0) {
-                result->flag = RUNTIME_ERROR;
-            }
+        
+        if (config->max_memory != MEMORY_UNLIMITED && result->memory > config->max_memory) {
+            result->flag = MEMORY_LIMIT_EXCEEDED;
         }
+        
         gettimeofday(&end, NULL);
         result->real_time = (int) (end.tv_sec * 1000 + end.tv_usec / 1000 - start.tv_sec * 1000 - start.tv_usec / 1000);
+        if (result->real_time > config->max_real_time) {
+            result->flag = REAL_TIME_LIMIT_EXCEEDED;
+        }
+        if(result->cpu_time > config->max_cpu_time) {
+            result->flag = CPU_TIME_LIMIT_EXCEEDED;
+        }
         log_close(log_fp);
     }
 }
