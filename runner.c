@@ -249,8 +249,7 @@ void run(struct config *config, struct result *result) {
             if (pthread_create(&tid, NULL, timeout_killer, (void *) (&timeout_killer_args)) != 0) {
                 LOG_FATAL(log_fp, "pthread_create failed");
                 result->flag = SYSTEM_ERROR;
-                log_close(log_fp);
-                return;
+                // parent process can not exit now, or child process will become zombie
             }
         }
 
