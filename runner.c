@@ -22,13 +22,14 @@
 #include "logger.h"
 
 #define STACK_SIZE (2 * 1024 * 1024)
+#define MAX_NPROCESS 10
 
 
 int child_process(void *child_process_args){
     FILE *log_fp = ((struct child_process_args *)child_process_args)->log_fp;
     struct config *config = ((struct child_process_args *)child_process_args)->config;
     FILE *in_file = NULL, *out_file = NULL, *err_file = NULL;
-    struct rlimit memory_limit, cpu_time_rlimit;
+    struct rlimit memory_limit, cpu_time_rlimit, nprocess_limit;
 #ifndef __APPLE__
     int i;
     int syscall_whitelist[] = {SCMP_SYS(read), SCMP_SYS(fstat),
@@ -40,7 +41,8 @@ int child_process(void *child_process_args){
     int syscall_whitelist_length = sizeof(syscall_whitelist) / sizeof(int);
     scmp_filter_ctx ctx = NULL;
 #endif
-    // child process
+    nprocess_limit.rlim_cur = nprocess_limit.rlim_max = MAX_NPROCESS;
+    
     // On success, these system calls return 0.
     // On error, -1 is returned, and errno is set appropriately.
     if (config->max_memory != MEMORY_UNLIMITED) {
@@ -113,6 +115,10 @@ int child_process(void *child_process_args){
         LOG_FATAL(log_fp, "setuid failed, errno: %d", errno);
         ERROR(log_fp, SET_UID_FAILED);
     }
+    if (setrlimit(RLIMIT_NPROC, &nprocess_limit) == -1) {
+        LOG_FATAL(log_fp, "setrlimit nproc failed");
+        ERROR(log_fp, SETRLIMIT_FAILED);
+    }
 #ifndef __APPLE__
     if (config->use_sandbox != 0) {
         // load seccomp rules
@@ -174,7 +180,7 @@ void *timeout_killer(void *timeout_killer_args) {
         kill_pid(pid);
         return NULL;
     }
-    if (kill(pid, SIGKILL) != 0) {
+    if (kill_pid(pid) != 0) {
         LOG_WARNING(log_fp, "kill failed, pid: %d", pid);
         return NULL;
     }
@@ -231,7 +237,7 @@ void run(struct config *config, struct result *result) {
 
     child_process_args.config = config;
     child_process_args.log_fp = log_fp;
-    pid = clone(child_process, stack + STACK_SIZE, SIGCHLD, (void *)(&child_process_args));
+    pid = clone(child_process, stack + STACK_SIZE, SIGCHLD | CLONE_NEWPID, (void *)(&child_process_args));
 
     if (pid < 0) {
         LOG_FATAL(log_fp, "clone failed");
