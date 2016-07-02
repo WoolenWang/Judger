@@ -203,32 +203,32 @@ void run(struct config *config, struct result *result) {
     struct timeout_killer_args timeout_killer_args;
     
     log_fp = log_open(config->log_path);
-    if(log_fp == NULL){
+    if (log_fp == NULL) {
         result->flag = SYSTEM_ERROR;
         return;
     }
 
     gettimeofday(&start, NULL);
 
-    if(config->max_memory < 1 && config->max_memory != MEMORY_UNLIMITED) {
+    if (config->max_memory < 1 && config->max_memory != MEMORY_UNLIMITED) {
         LOG_FATAL(log_fp, "max_memory must > 1 or unlimited");
         result->flag = SYSTEM_ERROR;
         log_close(log_fp);
         return;
     }
-    if(config->max_cpu_time < 1 && config->max_cpu_time != CPU_TIME_UNLIMITED) {
+    if (config->max_cpu_time < 1 && config->max_cpu_time != CPU_TIME_UNLIMITED) {
         LOG_FATAL(log_fp, "max_cpu_time must > 1 or unlimited");
         result->flag = SYSTEM_ERROR;
         log_close(log_fp);
         return;
     }
     else if (config->max_cpu_time != CPU_TIME_UNLIMITED && config->max_real_time < 1) {
-            LOG_FATAL(log_fp, "max_real_time must be set when max_cpu_time is set");
-            result->flag = SYSTEM_ERROR;
-            log_close(log_fp);
-            return;
+        LOG_FATAL(log_fp, "max_real_time must be set when max_cpu_time is set");
+        result->flag = SYSTEM_ERROR;
+        log_close(log_fp);
+        return;
     }
-    if((stack = malloc(STACK_SIZE)) == NULL) {
+    if ((stack = malloc(STACK_SIZE)) == NULL) {
         LOG_FATAL(log_fp, "malloc stack failed");
         result->flag = SYSTEM_ERROR;
         log_close(log_fp);
@@ -280,7 +280,7 @@ void run(struct config *config, struct result *result) {
                                   resource_usage.ru_stime.tv_sec * 1000 +
                                   resource_usage.ru_stime.tv_usec / 1000);
          // avoid 0 ms
-        if(result->cpu_time == 0) {
+        if (result->cpu_time == 0) {
             result->cpu_time = 1;
         }
 
@@ -325,7 +325,7 @@ void run(struct config *config, struct result *result) {
         if (result->real_time > config->max_real_time) {
             result->flag = REAL_TIME_LIMIT_EXCEEDED;
         }
-        if(result->cpu_time > config->max_cpu_time) {
+        if (result->cpu_time > config->max_cpu_time) {
             result->flag = CPU_TIME_LIMIT_EXCEEDED;
         }
         log_close(log_fp);
